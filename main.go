@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-// Context from phase 1
-type Context struct {
+// InertiaContext from phase 1
+type InertiaContext struct {
 	Date       string              `json:"date"`
 	Gazetteer  Gazetteer           `json:"gazetteer"`
 	State      State               `json:"state"`
@@ -105,6 +105,35 @@ type TaskContext struct {
 	HistoricalWeight float64
 }
 
+var (
+	// commandRunner is used for all external CLI calls, allowing mocking in tests
+	commandRunner CommandRunner = &RealRunner{}
+	// now allows deterministic testing of time-based logic
+	nowFunc = time.Now
+)
+
+type CommandRunner interface {
+	Run(name string, args ...string) error
+	Output(name string, args ...string) ([]byte, error)
+	RunWithStdin(stdin string, name string, args ...string) ([]byte, error)
+}
+
+type RealRunner struct{}
+
+func (r *RealRunner) Run(name string, args ...string) error {
+	return exec.Command(name, args...).Run()
+}
+
+func (r *RealRunner) Output(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).Output()
+}
+
+func (r *RealRunner) RunWithStdin(stdin string, name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	cmd.Stdin = strings.NewReader(stdin)
+	return cmd.Output()
+}
+
 func main() {
 	contextFile := flag.String("context", "logs/inertia-context-2026-02-22.json", "Path to context JSON")
 	dryRun := flag.Bool("dry-run", false, "Don't execute td commands, just show decisions")
@@ -153,13 +182,13 @@ func main() {
 	log.Printf("Inertia Engine complete!")
 }
 
-func loadContext(path string) (*Context, error) {
+func loadContext(path string) (*InertiaContext, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read file: %w", err)
 	}
 
-	var ctx Context
+	var ctx InertiaContext
 	if err := json.Unmarshal(data, &ctx); err != nil {
 		return nil, fmt.Errorf("unmarshal: %w", err)
 	}
@@ -168,8 +197,7 @@ func loadContext(path string) (*Context, error) {
 }
 
 func fetchAllTasks() ([]Task, error) {
-	cmd := exec.Command("td", "task", "list", "--json", "--full")
-	output, err := cmd.Output()
+	output, err := commandRunner.Output("td", "task", "list", "--json", "--full")
 	if err != nil {
 		return nil, fmt.Errorf("td command: %w", err)
 	}
@@ -202,7 +230,7 @@ func filterLeafNodes(tasks []Task) []Task {
 	return leafTasks
 }
 
-func processTasksParallel(tasks []Task, context *Context, maxConcurrency int) []Decision {
+func processTasksParallel(tasks []Task, context *InertiaContext, maxConcurrency int) []Decision {
 	results := make(chan Decision, len(tasks))
 	sem := make(chan struct{}, maxConcurrency)
 	var wg sync.WaitGroup
@@ -235,7 +263,7 @@ func processTasksParallel(tasks []Task, context *Context, maxConcurrency int) []
 	return decisions
 }
 
-func processTask(task Task, context *Context) Decision {
+func processTask(task Task, context *InertiaContext) Decision {
 	// Build task context by matching to gazetteer
 	taskCtx := contextualizeTask(task, context)
 
@@ -245,7 +273,7 @@ func processTask(task Task, context *Context) Decision {
 	return decision
 }
 
-func contextualizeTask(task Task, context *Context) TaskContext {
+func contextualizeTask(task Task, context *InertiaContext) TaskContext {
 	taskText := strings.ToLower(task.Content + " " + task.Description)
 
 	// Find related entities by keyword matching
@@ -275,7 +303,7 @@ func contextualizeTask(task Task, context *Context) TaskContext {
 	}
 
 	// Calculate age in days
-	ageDays := int(time.Since(task.AddedAt).Hours() / 24)
+	ageDays := int(nowFunc().Sub(task.AddedAt).Hours() / 24)
 
 	// Calculate historical weight (max span_years from related concepts)
 	var maxSpan float64
@@ -302,15 +330,9 @@ func callAgentForDecision(taskCtx TaskContext) Decision {
 	prompt := buildDecisionPrompt(taskCtx)
 
 	// Call openclaw chat with prompt via stdin
-	cmd := exec.Command("openclaw", "chat")
-	cmd.Stdin = strings.NewReader(prompt)
-	output, err := cmd.Output()
+	output, err := commandRunner.RunWithStdin(prompt, "openclaw", "chat")
 	if err != nil {
-		stderr := ""
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr = string(exitErr.Stderr)
-		}
-		log.Printf("LLM call failed for task %s: %v | stderr: %s", taskCtx.Task.ID, err, stderr)
+		log.Printf("LLM call failed for task %s: %v", taskCtx.Task.ID, err)
 		return Decision{
 			TaskID: taskCtx.Task.ID,
 			Action: "skip",
@@ -338,7 +360,7 @@ func buildDecisionPrompt(taskCtx TaskContext) string {
 	if len(taskCtx.RelatedConcepts) > 0 {
 		sb.WriteString("Related concepts from diary history:\n")
 		for _, c := range taskCtx.RelatedConcepts {
-			sb.WriteString(fmt.Sprintf("- %s (%.0f years): %s\n", c.Name, c.SpanYears, c.Context))
+			sb.WriteString(fmt.Sprintf("- %s (%.0f years): %s\n", c.Name, c.GetSpanYears(), c.Context))
 		}
 		sb.WriteString("\n")
 	}
@@ -436,24 +458,21 @@ func executeDecision(decision Decision) {
 
 	case "reprioritize":
 		if decision.Priority != nil {
-			cmd := exec.Command("td", "task", "update", decision.TaskID, "--priority", fmt.Sprintf("%d", *decision.Priority))
-			if err := cmd.Run(); err != nil {
+			if err := commandRunner.Run("td", "task", "update", decision.TaskID, "--priority", fmt.Sprintf("p%d", *decision.Priority)); err != nil {
 				log.Printf("Failed to reprioritize task %s: %v", decision.TaskID, err)
 			}
 		}
 
 	case "recontextualize":
 		if decision.NewContent != nil {
-			cmd := exec.Command("td", "task", "update", decision.TaskID, "--content", *decision.NewContent)
-			if err := cmd.Run(); err != nil {
+			if err := commandRunner.Run("td", "task", "update", decision.TaskID, "--content", *decision.NewContent); err != nil {
 				log.Printf("Failed to recontextualize task %s: %v", decision.TaskID, err)
 			}
 		}
 
 	case "decompose":
 		for _, subtask := range decision.Subtasks {
-			cmd := exec.Command("td", "task", "add", subtask, "--parent-id", decision.TaskID)
-			if err := cmd.Run(); err != nil {
+			if err := commandRunner.Run("td", "task", "add", subtask, "--parent", decision.TaskID); err != nil {
 				log.Printf("Failed to add subtask to %s: %v", decision.TaskID, err)
 			}
 		}
@@ -463,3 +482,4 @@ func executeDecision(decision Decision) {
 		log.Printf("Ice-boxing task %s (implement project move)", decision.TaskID)
 	}
 }
+

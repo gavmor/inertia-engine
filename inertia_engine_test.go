@@ -1,72 +1,218 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"time"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
-var _ = Describe("Inertia Engine", func() {
+type MockRunner struct {
+	CalledCommands [][]string
+	Outputs        map[string][]byte
+	Errors         map[string]error
+	StdinSent      string
+}
 
-	Describe("Context Orchestration", func() {
-		It("should successfully ingest and parse the historical gazetteer from JSON", func() {
-			// Scenario: Orchestrator is provided a valid JSON file containing 
-			// people, projects, and concepts with varying historical spans.
+func (m *MockRunner) Run(name string, args ...string) error {
+	m.CalledCommands = append(m.CalledCommands, append([]string{name}, args...))
+	return m.Errors[name]
+}
+
+func (m *MockRunner) Output(name string, args ...string) ([]byte, error) {
+	m.CalledCommands = append(m.CalledCommands, append([]string{name}, args...))
+	return m.Outputs[name], m.Errors[name]
+}
+
+func (m *MockRunner) RunWithStdin(stdin string, name string, args ...string) ([]byte, error) {
+	m.StdinSent = stdin
+	m.CalledCommands = append(m.CalledCommands, append([]string{name}, args...))
+	return m.Outputs[name], m.Errors[name]
+}
+
+var _ = Describe("Inertia Engine Orchestrator", func() {
+	var mock *MockRunner
+
+	BeforeEach(func() {
+		mock = &MockRunner{
+			Outputs: make(map[string][]byte),
+			Errors:  make(map[string]error),
+		}
+		commandRunner = mock
+		nowFunc = func() time.Time {
+			t, _ := time.Parse(time.RFC3339, "2026-02-24T12:00:00Z")
+			return t
+		}
+	})
+
+	Describe("Phase 2: Task Processing Lifecycle", func() {
+		Context("when starting the orchestration", func() {
+			It("should load the context JSON artifact generated in Phase 1", func() {
+				tmpFile, err := os.CreateTemp("", "context-*.json")
+				Expect(err).NotTo(HaveOccurred())
+				defer os.Remove(tmpFile.Name())
+
+				ctx := InertiaContext{
+					Date: "2026-02-22",
+					Gazetteer: Gazetteer{
+						Concepts: []Entity{{Name: "Journaling", Context: "Daily habit"}},
+					},
+				}
+				data, _ := json.Marshal(ctx)
+				os.WriteFile(tmpFile.Name(), data, 0644)
+
+				loaded, err := loadContext(tmpFile.Name())
+				Expect(err).NotTo(HaveOccurred())
+				Expect(loaded.Date).To(Equal("2026-02-22"))
+				Expect(loaded.Gazetteer.Concepts).To(HaveLen(1))
+				Expect(loaded.Gazetteer.Concepts[0].Name).To(Equal("Journaling"))
+			})
+
+			It("should fetch all active tasks using the 'td' CLI", func() {
+				resp := TasksResponse{
+					Results: []Task{{ID: "1", Content: "Test Task"}},
+				}
+				data, _ := json.Marshal(resp)
+				mock.Outputs["td"] = data
+
+				tasks, err := fetchAllTasks()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(tasks).To(HaveLen(1))
+				Expect(mock.CalledCommands).To(ContainElement([]string{"td", "task", "list", "--json", "--full"}))
+			})
 		})
 
-		It("should gracefully handle missing or malformed context files", func() {
-			// Scenario: The --context flag points to a non-existent path or 
-			// a file that doesn't follow the Gazetteer schema.
+		Context("when preparing tasks for processing", func() {
+			It("should filter for leaf nodes to prevent redundant updates to parent tasks", func() {
+				parentID := "p1"
+				tasks := []Task{
+					{ID: "p1", Content: "Parent"},
+					{ID: "c1", Content: "Child", ParentID: &parentID},
+					{ID: "l1", Content: "Lone Task"},
+				}
+
+				leafTasks := filterLeafNodes(tasks)
+				Expect(leafTasks).To(HaveLen(2))
+				
+				ids := []string{leafTasks[0].ID, leafTasks[1].ID}
+				Expect(ids).To(ContainElements("c1", "l1"))
+				Expect(ids).ToNot(ContainElement("p1"))
+			})
+
+			It("should identify related concepts in the gazetteer via keyword matching", func() {
+				ctx := &InertiaContext{
+					Gazetteer: Gazetteer{
+						Concepts: []Entity{
+							{Name: "Journaling", Context: "10 years"},
+							{Name: "Coding", Context: "5 years"},
+						},
+					},
+				}
+				task := Task{Content: "Finish journaling entry", Description: "Use the new app"}
+
+				taskCtx := contextualizeTask(task, ctx)
+				Expect(taskCtx.RelatedConcepts).To(HaveLen(1))
+				Expect(taskCtx.RelatedConcepts[0].Name).To(Equal("Journaling"))
+			})
 		})
 	})
 
-	Describe("Task Filtering and Selection", func() {
-		It("should only select leaf nodes to avoid redundant parent task updates", func() {
-			// Scenario: A Todoist project has a complex hierarchy. 
-			// The engine must only process tasks that have no active children.
+	Describe("Inertia Scoring Algorithm", func() {
+		Context("Historical Weight (40%)", func() {
+			var ctx *InertiaContext
+			BeforeEach(func() {
+				ctx = &InertiaContext{
+					Gazetteer: Gazetteer{
+						Concepts: []Entity{
+							{Name: "LongTerm", SpanYears: json.RawMessage(`10`)},
+							{Name: "MidTerm", SpanYears: json.RawMessage(`5`)},
+							{Name: "ShortTerm", SpanYears: json.RawMessage(`0.4`)},
+						},
+					},
+				}
+			})
+
+			It("should award 10 points for commitments spanning 10+ years", func() {
+				task := Task{Content: "A LongTerm task"}
+				taskCtx := contextualizeTask(task, ctx)
+				Expect(taskCtx.HistoricalWeight).To(BeNumerically("==", 10))
+			})
+			It("should award 5 points for commitments spanning 5 years", func() {
+				task := Task{Content: "A MidTerm task"}
+				taskCtx := contextualizeTask(task, ctx)
+				Expect(taskCtx.HistoricalWeight).To(BeNumerically("==", 5))
+			})
+			It("should award less than 1 point for commitments spanning less than 6 months (0.4 years)", func() {
+				task := Task{Content: "A ShortTerm task"}
+				taskCtx := contextualizeTask(task, ctx)
+				Expect(taskCtx.HistoricalWeight).To(BeNumerically("==", 0.4))
+			})
 		})
 
-		It("should maintain task order and integrity when filtering", func() {
-			// Scenario: Ensure that the filtering process doesn't corrupt task data
-			// or drop standalone tasks that aren't part of a hierarchy.
+		Context("State Alignment (30%)", func() {
+			// Note: processTask calls callAgentForDecision which uses the prompt.
+			// The score calculation is actually inside the LLM prompt instructions
+			// and performed by the LLM, but we verify the context passed to the LLM is correct.
+			
+			It("should include state markers in the prompt for LLM alignment", func() {
+				taskCtx := TaskContext{
+					Task:  Task{Content: "Creative Task"},
+					State: State{Energy: "high", Mood: "inspired", Environment: "home"},
+				}
+				prompt := buildDecisionPrompt(taskCtx)
+				Expect(prompt).To(ContainSubstring("Energy: high"))
+				Expect(prompt).To(ContainSubstring("Mood: inspired"))
+				Expect(prompt).To(ContainSubstring("Environment: home"))
+			})
 		})
 	})
 
-	Describe("Inertia Scoring Logic", func() {
-		It("should calculate a high inertia score for long-term historical commitments", func() {
-			// Scenario: A task matches a concept with 10+ years of diary history.
-			// It should be weighted significantly higher than a recent task.
-		})
+	Describe("Decision Logic & Actions", func() {
+		Context("when the LLM determines an action", func() {
+			It("should parse 'skip' if no changes are required", func() {
+				resp := `{"action": "skip", "reasoning": "all good"}`
+				decision := parseDecisionResponse(resp, "123")
+				Expect(decision.Action).To(Equal("skip"))
+			})
 
-		It("should adjust priority based on current energy and environment alignment", func() {
-			// Scenario: High energy mood should favor creative tasks, 
-			// while specific environments (like 'home') should favor local maintenance.
-		})
+			It("should parse 'decompose' with subtasks", func() {
+				resp := `Some chatter {"action": "decompose", "subtasks": ["step 1", "step 2"], "reasoning": "too big"}`
+				decision := parseDecisionResponse(resp, "123")
+				Expect(decision.Action).To(Equal("decompose"))
+				Expect(decision.Subtasks).To(ConsistOf("step 1", "step 2"))
+			})
 
-		It("should handle entities with unknown or zero historical span correctly", func() {
-			// Scenario: A task matches a person or project with no prior diary mentions.
-			// It should receive a baseline score without historical weight.
-		})
-	})
-
-	Describe("LLM Interaction and Decision Parsing", func() {
-		It("should robustly extract JSON decisions from conversational LLM output", func() {
-			// Scenario: The LLM responds with a mix of conversational text and a JSON block.
-			// The engine must extract only the valid decision object.
-		})
-
-		It("should fallback to 'skip' when the LLM provides an unparseable response", func() {
-			// Scenario: The LLM response is completely malformed or missing required fields.
+			It("should parse 'reprioritize' with new priority", func() {
+				resp := `{"action": "reprioritize", "priority": 1, "reasoning": "urgent"}`
+				decision := parseDecisionResponse(resp, "123")
+				Expect(decision.Action).To(Equal("reprioritize"))
+				Expect(*decision.Priority).To(Equal(1))
+			})
 		})
 	})
 
-	Describe("Concurrency and Execution Safety", func() {
-		It("should respect the concurrency limit for external LLM calls", func() {
-			// Scenario: Processing 100 tasks with a concurrency of 10.
-			// No more than 10 requests should be in-flight simultaneously.
+	Describe("Concurrency & Execution Safety", func() {
+		It("should execute 'td' update commands correctly", func() {
+			priority := 2
+			decision := Decision{
+				TaskID:   "123",
+				Action:   "reprioritize",
+				Priority: &priority,
+			}
+			executeDecision(decision)
+			Expect(mock.CalledCommands).To(ContainElement([]string{"td", "task", "update", "123", "--priority", "p2"}))
 		})
 
-		It("should suppress all side-effects when running in dry-run mode", func() {
-			// Scenario: The --dry-run flag is set. No 'td' commands should actually be executed.
+		It("should handle decomposition by adding subtasks", func() {
+			decision := Decision{
+				TaskID:   "123",
+				Action:   "decompose",
+				Subtasks: []string{"sub 1"},
+			}
+			executeDecision(decision)
+			Expect(mock.CalledCommands).To(ContainElement([]string{"td", "task", "add", "sub 1", "--parent", "123"}))
 		})
 	})
 })
