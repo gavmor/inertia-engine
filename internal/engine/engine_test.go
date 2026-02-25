@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"encoding/json"
@@ -40,8 +40,8 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 			Outputs: make(map[string][]byte),
 			Errors:  make(map[string]error),
 		}
-		commandRunner = mock
-		nowFunc = func() time.Time {
+		CommandRunner = mock
+		NowFunc = func() time.Time {
 			t, _ := time.Parse(time.RFC3339, "2026-02-24T12:00:00Z")
 			return t
 		}
@@ -63,7 +63,7 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 				data, _ := json.Marshal(ctx)
 				os.WriteFile(tmpFile.Name(), data, 0644)
 
-				loaded, err := loadContext(tmpFile.Name())
+				loaded, err := LoadContext(tmpFile.Name())
 				Expect(err).NotTo(HaveOccurred())
 				Expect(loaded.Date).To(Equal("2026-02-22"))
 				Expect(loaded.Gazetteer.Concepts).To(HaveLen(1))
@@ -77,7 +77,7 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 				data, _ := json.Marshal(resp)
 				mock.Outputs["td"] = data
 
-				tasks, err := fetchAllTasks()
+				tasks, err := FetchAllTasks()
 				Expect(err).NotTo(HaveOccurred())
 				Expect(tasks).To(HaveLen(1))
 				Expect(mock.CalledCommands).To(ContainElement([]string{"td", "task", "list", "--json", "--full"}))
@@ -93,7 +93,7 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 					{ID: "l1", Content: "Lone Task"},
 				}
 
-				leafTasks := filterLeafNodes(tasks)
+				leafTasks := FilterLeafNodes(tasks)
 				Expect(leafTasks).To(HaveLen(2))
 				
 				ids := []string{leafTasks[0].ID, leafTasks[1].ID}
@@ -112,7 +112,7 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 				}
 				task := Task{Content: "Finish journaling entry", Description: "Use the new app"}
 
-				taskCtx := contextualizeTask(task, ctx)
+				taskCtx := ContextualizeTask(task, ctx)
 				Expect(taskCtx.RelatedConcepts).To(HaveLen(1))
 				Expect(taskCtx.RelatedConcepts[0].Name).To(Equal("Journaling"))
 			})
@@ -136,32 +136,28 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 
 			It("should award 10 points for commitments spanning 10+ years", func() {
 				task := Task{Content: "A LongTerm task"}
-				taskCtx := contextualizeTask(task, ctx)
+				taskCtx := ContextualizeTask(task, ctx)
 				Expect(taskCtx.HistoricalWeight).To(BeNumerically("==", 10))
 			})
 			It("should award 5 points for commitments spanning 5 years", func() {
 				task := Task{Content: "A MidTerm task"}
-				taskCtx := contextualizeTask(task, ctx)
+				taskCtx := ContextualizeTask(task, ctx)
 				Expect(taskCtx.HistoricalWeight).To(BeNumerically("==", 5))
 			})
 			It("should award less than 1 point for commitments spanning less than 6 months (0.4 years)", func() {
 				task := Task{Content: "A ShortTerm task"}
-				taskCtx := contextualizeTask(task, ctx)
+				taskCtx := ContextualizeTask(task, ctx)
 				Expect(taskCtx.HistoricalWeight).To(BeNumerically("==", 0.4))
 			})
 		})
 
 		Context("State Alignment (30%)", func() {
-			// Note: processTask calls callAgentForDecision which uses the prompt.
-			// The score calculation is actually inside the LLM prompt instructions
-			// and performed by the LLM, but we verify the context passed to the LLM is correct.
-			
 			It("should include state markers in the prompt for LLM alignment", func() {
 				taskCtx := TaskContext{
 					Task:  Task{Content: "Creative Task"},
 					State: State{Energy: "high", Mood: "inspired", Environment: "home"},
 				}
-				prompt := buildDecisionPrompt(taskCtx)
+				prompt := BuildDecisionPrompt(taskCtx)
 				Expect(prompt).To(ContainSubstring("Energy: high"))
 				Expect(prompt).To(ContainSubstring("Mood: inspired"))
 				Expect(prompt).To(ContainSubstring("Environment: home"))
@@ -173,20 +169,20 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 		Context("when the LLM determines an action", func() {
 			It("should parse 'skip' if no changes are required", func() {
 				resp := `{"action": "skip", "reasoning": "all good"}`
-				decision := parseDecisionResponse(resp, "123")
+				decision := ParseDecisionResponse(resp, "123")
 				Expect(decision.Action).To(Equal("skip"))
 			})
 
 			It("should parse 'decompose' with subtasks", func() {
 				resp := `Some chatter {"action": "decompose", "subtasks": ["step 1", "step 2"], "reasoning": "too big"}`
-				decision := parseDecisionResponse(resp, "123")
+				decision := ParseDecisionResponse(resp, "123")
 				Expect(decision.Action).To(Equal("decompose"))
 				Expect(decision.Subtasks).To(ConsistOf("step 1", "step 2"))
 			})
 
 			It("should parse 'reprioritize' with new priority", func() {
 				resp := `{"action": "reprioritize", "priority": 1, "reasoning": "urgent"}`
-				decision := parseDecisionResponse(resp, "123")
+				decision := ParseDecisionResponse(resp, "123")
 				Expect(decision.Action).To(Equal("reprioritize"))
 				Expect(*decision.Priority).To(Equal(1))
 			})
@@ -201,7 +197,7 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 				Action:   "reprioritize",
 				Priority: &priority,
 			}
-			executeDecision(decision)
+			ExecuteDecision(decision)
 			Expect(mock.CalledCommands).To(ContainElement([]string{"td", "task", "update", "123", "--priority", "p2"}))
 		})
 
@@ -211,7 +207,7 @@ var _ = Describe("Inertia Engine Orchestrator", func() {
 				Action:   "decompose",
 				Subtasks: []string{"sub 1"},
 			}
-			executeDecision(decision)
+			ExecuteDecision(decision)
 			Expect(mock.CalledCommands).To(ContainElement([]string{"td", "task", "add", "sub 1", "--parent", "123"}))
 		})
 	})

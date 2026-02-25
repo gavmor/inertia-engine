@@ -1,4 +1,4 @@
-package main
+package engine
 
 import (
 	"testing"
@@ -7,7 +7,7 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestInertiaEngine(t *testing.T) {
+func TestEngine(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Inertia Engine Suite")
+	RunSpecs(t, "Engine Suite")
 }
