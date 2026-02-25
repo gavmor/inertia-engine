@@ -1,0 +1,12 @@
+# Binaries
+inertia-engine
+
+# Logs
+logs/
+*.log
+
+# Dependencies
+vendor/
+
+# OS specific
+.DS_Store
